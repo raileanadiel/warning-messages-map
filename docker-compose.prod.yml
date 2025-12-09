@@ -1,9 +1,0 @@
-services:
-  app:
-    container_name: warning-messages-app-prod
-    image: raileanadiel/warning-messages-app:latest
-    restart: unless-stopped
-    ports:
-      - "80:80"
-
-

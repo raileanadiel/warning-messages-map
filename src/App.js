@@ -88,16 +88,17 @@ function App() {
     };
   }, []);
 
-  const center = warnings.length
-    ? [warnings[0].point[0], warnings[0].point[1]]
-    : [51.505, -0.09];
+  // Default view: Europe-wide; if we have warnings, center & zoom in on the first one
+  const hasWarnings = warnings.length > 0;
+  const center = hasWarnings ? [warnings[0].point[0], warnings[0].point[1]] : [54.0, 15.0];
+  const zoom = hasWarnings ? 8 : 4;
 
   return (
     <div className="App">
       <div className="Map-wrapper">
         <MapContainer
           center={center}
-          zoom={8}
+          zoom={zoom}
           scrollWheelZoom={true}
           className="Leaflet-map"
         >

@@ -7,6 +7,7 @@ WORKDIR /app
 
 # Install dependencies separately for better caching
 COPY package.json package-lock.json* ./
+COPY .env* ./
 RUN npm ci --omit=dev || npm install --omit=dev
 
 # Copy the rest of the application source
@@ -21,6 +22,9 @@ FROM nginx:1.27-alpine
 
 # Copy built assets from previous stage
 COPY --from=build /app/build /usr/share/nginx/html
+
+# Custom Nginx configuration (serves SPA and proxies /api to external service)
+COPY nginx.conf /etc/nginx/conf.d/default.conf
 
 # Expose HTTP on port 80 (Caddy will terminate HTTPS in front of this)
 EXPOSE 80

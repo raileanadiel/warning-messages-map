@@ -1,0 +1,25 @@
+## Development Dockerfile - runs CRA dev server with hot reloading
+
+FROM node:20-alpine
+
+WORKDIR /app
+
+# Install dependencies (will be cached unless package.json/package-lock.json change)
+COPY package.json package-lock.json* ./
+COPY .env* ./
+RUN npm install && npm install -g react-scripts@5.0.1
+
+# Copy source code (can also be mounted as a volume via docker-compose)
+COPY public ./public
+COPY src ./src
+
+# Expose CRA default dev server port
+EXPOSE 3000
+
+# Environment hints for React scripts (Docker + disable ESLint plugin issues)
+ENV CHOKIDAR_USEPOLLING=true
+ENV DISABLE_ESLINT_PLUGIN=true
+
+CMD ["npm", "start"]
+
+

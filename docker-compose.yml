@@ -1,0 +1,21 @@
+version: "3.9"
+
+services:
+  app:
+    container_name: warning-messages-app-dev
+    build:
+      context: /home/adiel/Desktop/warning-messages-app
+      dockerfile: Dockerfile.dev
+    ports:
+      - "3000:3000"
+    volumes:
+      - /home/adiel/Desktop/warning-messages-app/src:/app/src
+      - /home/adiel/Desktop/warning-messages-app/public:/app/public
+      # Use container's own node_modules (installed at build time)
+      - /app/node_modules
+    environment:
+      - CHOKIDAR_USEPOLLING=true
+    stdin_open: true
+    tty: true
+
+

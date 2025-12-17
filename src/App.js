@@ -1,8 +1,8 @@
 import './App.css';
 import 'leaflet/dist/leaflet.css';
 import '@mdi/font/css/materialdesignicons.min.css';
-import { useEffect, useRef, useState } from 'react';
-import { MapContainer, TileLayer, Marker, Popup } from 'react-leaflet';
+import { useEffect, useMemo, useRef, useState } from 'react';
+import { MapContainer, TileLayer, Marker, Popup, Rectangle, useMapEvents } from 'react-leaflet';
 import L from 'leaflet';
 
 // In development, CRA's proxy (defined in package.json) will forward this
@@ -10,16 +10,198 @@ import L from 'leaflet';
 const API_URL = '/api/messages/warning-messages';
 const AUTH_TOKEN = process.env.REACT_APP_X_AUTH;
 
-const markerIcon = L.divIcon({
+const warningMarkerIcon = L.divIcon({
   className: 'custom-marker-icon',
   html: '<i class="mdi mdi-map-marker-alert"></i>',
   iconSize: [32, 32],
   iconAnchor: [16, 32],
 });
 
+const policeMarkerIcon = L.divIcon({
+  className: 'police-marker-icon',
+  html: '<div class="police-marker-icon__dot" aria-label="Police">P</div>',
+  iconSize: [28, 28],
+  iconAnchor: [14, 14],
+});
+
+const WAZE_ALERTS_BASE_URL = '/waze/live-map/api/georss?types=alerts';
+const MAX_WAZE_TILE_BOXES_PER_REQUEST = 24;
+const MIN_WAZE_FETCH_INTERVAL_MS = 2500;
+const DEFAULT_WAZE_RETRY_AFTER_SEC = 30;
+
+function inferWazeEnvFromBounds(bounds) {
+  if (!bounds) return 'na';
+  const center = bounds.getCenter();
+  const lat = center.lat;
+  const lng = normalizeLng(center.lng);
+  // Heuristic: North America longitudes roughly [-170, -30]
+  if (lng <= -30 && lng >= -170 && lat >= 5 && lat <= 85) return 'na';
+  return 'row';
+}
+
+function isPoliceAlert(alert) {
+  const type = String(alert?.type || '').toLowerCase();
+  const subtype = String(alert?.subtype || '').toLowerCase();
+  return type.includes('police') || subtype.includes('police');
+}
+
+function normalizeLng(lng) {
+  // Leaflet can return longitudes outside [-180, 180] when the map wraps.
+  // Normalize for upstream APIs that expect standard lon range.
+  const n = ((lng + 180) % 360 + 360) % 360 - 180;
+  // Avoid returning -180 when 180 is more intuitive at the boundary.
+  return n === -180 ? 180 : n;
+}
+
+function clampLat(lat) {
+  // WebMercator practical max latitude
+  return Math.max(Math.min(lat, 85.05112878), -85.05112878);
+}
+
+// WebMercator tile math (slippy map)
+function lng2tileX(lng, z) {
+  const n = 2 ** z;
+  return Math.floor(((lng + 180) / 360) * n);
+}
+function lat2tileY(lat, z) {
+  const n = 2 ** z;
+  const latRad = (clampLat(lat) * Math.PI) / 180;
+  return Math.floor(((1 - Math.log(Math.tan(latRad) + 1 / Math.cos(latRad)) / Math.PI) / 2) * n);
+}
+function tileX2lng(x, z) {
+  const n = 2 ** z;
+  return (x / n) * 360 - 180;
+}
+function tileY2lat(y, z) {
+  const n = 2 ** z;
+  const rad = Math.atan(Math.sinh(Math.PI * (1 - (2 * y) / n)));
+  return (rad * 180) / Math.PI;
+}
+
+function getNormalizedBoundsForDisplay(bounds) {
+  if (!bounds) return null;
+  const north = bounds.getNorth();
+  const south = bounds.getSouth();
+  const west = normalizeLng(bounds.getWest());
+  const east = normalizeLng(bounds.getEast());
+  return { north, south, west, east };
+}
+
+function buildWazeAlertsUrlsFromBoxes(boxes, env) {
+  return boxes.map((b) => {
+    const params = new URLSearchParams({
+      env: String(env || 'na'),
+      top: String(b.top),
+      bottom: String(b.bottom),
+      left: String(b.left),
+      right: String(b.right),
+    });
+    return `${WAZE_ALERTS_BASE_URL}&${params.toString()}`;
+  });
+}
+
+function parseRetryAfterToMs(retryAfterValue) {
+  if (!retryAfterValue) return DEFAULT_WAZE_RETRY_AFTER_SEC * 1000;
+  const asNumber = Number(retryAfterValue);
+  if (Number.isFinite(asNumber) && asNumber > 0) return asNumber * 1000;
+  const asDate = Date.parse(retryAfterValue);
+  if (!Number.isNaN(asDate)) return Math.max(0, asDate - Date.now());
+  return DEFAULT_WAZE_RETRY_AFTER_SEC * 1000;
+}
+
+function buildWazeTileSnappedQuery(bounds, zoom) {
+  // We compute tile-aligned boxes (for Waze-like snapping and optional debug rendering),
+  // but we only REQUEST a union bounding box per longitudinal span to avoid 429s.
+  // If too many tiles would be covered, we lower the zoom used for the query.
+  if (!bounds) return { requestBoxes: [], debugBoxes: [], usedZoom: zoom };
+
+  const north = clampLat(bounds.getNorth());
+  const south = clampLat(bounds.getSouth());
+  const west = normalizeLng(bounds.getWest());
+  const east = normalizeLng(bounds.getEast());
+
+  // Handle dateline crossing by splitting into two longitudinal spans.
+  const spans = west > east ? [{ west, east: 180 }, { west: -180, east }] : [{ west, east }];
+
+  let z = Math.max(0, Math.min(22, Math.round(zoom)));
+
+  const computeAtZoom = (zz) => {
+    const debugBoxes = [];
+    const requestBoxes = [];
+
+    for (const span of spans) {
+      // Avoid edge-case where east=180 maps to x=n (one past last tile).
+      const safeEast = span.east >= 180 ? 179.999999 : span.east;
+      // Avoid edge-case where south hits the WebMercator extreme and maps outside the last tile row.
+      const safeSouth = south <= -85.05112878 ? -85.05112877 : south;
+
+      // For tile ranges, we treat "top" as north and "bottom" as south.
+      const xMin = lng2tileX(span.west, zz);
+      const xMax = lng2tileX(safeEast, zz);
+      const yMin = lat2tileY(north, zz);
+      const yMax = lat2tileY(safeSouth, zz);
+
+      // Union box aligned to tile edges (one request per span)
+      const unionLeft = tileX2lng(xMin, zz);
+      const unionRight = tileX2lng(xMax + 1, zz);
+      const unionTop = tileY2lat(yMin, zz);
+      const unionBottom = tileY2lat(yMax + 1, zz);
+      requestBoxes.push({ top: unionTop, bottom: unionBottom, left: unionLeft, right: unionRight });
+
+      for (let x = xMin; x <= xMax; x += 1) {
+        // Keep X in [0..n-1] (for dateline split spans, xMin..xMax is already in-range)
+        const left = tileX2lng(x, zz);
+        const right = tileX2lng(x + 1, zz);
+
+        for (let y = yMin; y <= yMax; y += 1) {
+          const top = tileY2lat(y, zz);
+          const bottom = tileY2lat(y + 1, zz);
+          debugBoxes.push({ top, bottom, left, right });
+        }
+      }
+    }
+
+    return { requestBoxes, debugBoxes, tileCount: debugBoxes.length };
+  };
+
+  let computed = computeAtZoom(z);
+  while (computed.tileCount > MAX_WAZE_TILE_BOXES_PER_REQUEST && z > 0) {
+    z -= 1;
+    computed = computeAtZoom(z);
+  }
+
+  return { ...computed, usedZoom: z };
+}
+
+function MapBoundsWatcher({ onViewChange }) {
+  const map = useMapEvents({
+    moveend: () => onViewChange({ bounds: map.getBounds(), zoom: map.getZoom() }),
+    zoomend: () => onViewChange({ bounds: map.getBounds(), zoom: map.getZoom() }),
+  });
+
+  useEffect(() => {
+    onViewChange({ bounds: map.getBounds(), zoom: map.getZoom() });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  return null;
+}
+
 function App() {
   const [warnings, setWarnings] = useState([]);
   const audioRef = useRef(null);
+  const [mapBounds, setMapBounds] = useState(null);
+  const [mapZoom, setMapZoom] = useState(4);
+  const [showWazeBoxes, setShowWazeBoxes] = useState(false);
+  const [wazeEnvMode, setWazeEnvMode] = useState('auto'); // 'auto' | 'na' | 'row'
+
+  const [policeAlerts, setPoliceAlerts] = useState([]);
+  const [policeLoading, setPoliceLoading] = useState(false);
+  const [policeError, setPoliceError] = useState('');
+  const [policeLastUpdatedAt, setPoliceLastUpdatedAt] = useState(null);
+  const policeBackoffUntilRef = useRef(0);
+  const policeLastFetchAtRef = useRef(0);
+  const policeLastQueryKeyRef = useRef('');
 
   useEffect(() => {
     let isMounted = true;
@@ -88,30 +270,270 @@ function App() {
     };
   }, []);
 
+  useEffect(() => {
+    if (!mapBounds) return;
+
+    const controller = new AbortController();
+    const debounceMs = 650;
+    let timeoutId = null;
+
+    const run = async () => {
+      const now = Date.now();
+      if (now < policeBackoffUntilRef.current) {
+        const waitSec = Math.ceil((policeBackoffUntilRef.current - now) / 1000);
+        setPoliceError(`Rate limited by Waze (429). Retrying in ~${waitSec}s…`);
+        setPoliceLoading(false);
+        return;
+      }
+
+      if (now - policeLastFetchAtRef.current < MIN_WAZE_FETCH_INTERVAL_MS) {
+        // Too soon since last successful attempt; skip to avoid 429.
+        return;
+      }
+
+      setPoliceLoading(true);
+      setPoliceError('');
+
+      try {
+        const env = wazeEnvMode === 'auto' ? inferWazeEnvFromBounds(mapBounds) : wazeEnvMode;
+        const { requestBoxes } = buildWazeTileSnappedQuery(mapBounds, mapZoom);
+        const queryKey = JSON.stringify(requestBoxes.map((b) => ({
+          top: Number(b.top.toFixed(5)),
+          bottom: Number(b.bottom.toFixed(5)),
+          left: Number(b.left.toFixed(5)),
+          right: Number(b.right.toFixed(5)),
+        }))).concat(`|env=${env}`);
+
+        if (queryKey === policeLastQueryKeyRef.current) {
+          // No meaningful change in snapped bbox; avoid hammering.
+          setPoliceLoading(false);
+          return;
+        }
+
+        policeLastQueryKeyRef.current = queryKey;
+
+        const urls = buildWazeAlertsUrlsFromBoxes(requestBoxes, env);
+        const responses = await Promise.all(
+          urls.map((url) =>
+            fetch(url, {
+              signal: controller.signal,
+              headers: {
+                Accept: 'application/json',
+              },
+            })
+          )
+        );
+
+        for (const res of responses) {
+          if (!res.ok) {
+            if (res.status === 429) {
+              const retryAfter = res.headers.get('retry-after');
+              const backoffMs = parseRetryAfterToMs(retryAfter);
+              policeBackoffUntilRef.current = Date.now() + backoffMs;
+              throw new Error('Waze rate limit hit (429)');
+            }
+            throw new Error(`Waze request failed (${res.status})`);
+          }
+        }
+
+        const payloads = await Promise.all(responses.map((r) => r.json()));
+        const alerts = payloads.flatMap((data) => (Array.isArray(data?.alerts) ? data.alerts : []));
+
+        const police = alerts
+          .filter(isPoliceAlert)
+          .map((a) => {
+            const lat = a?.location?.y;
+            const lng = a?.location?.x;
+            if (typeof lat !== 'number' || typeof lng !== 'number') return null;
+
+            return {
+              id:
+                a?.uuid ||
+                a?.id ||
+                `${a?.type || 'unknown'}-${lng}-${lat}-${a?.pubMillis || ''}`,
+              uuid: a?.uuid || null,
+              type: a?.type || '',
+              subtype: a?.subtype || '',
+              street: a?.street || '',
+              city: a?.city || '',
+              pubMillis: a?.pubMillis || null,
+              location: { lat, lng },
+              raw: a,
+            };
+          })
+          .filter(Boolean);
+
+        if (!controller.signal.aborted) {
+          // Dedupe by id/uuid in case we had to split requests over dateline
+          const byId = new Map(police.map((p) => [p.id, p]));
+          setPoliceAlerts(Array.from(byId.values()));
+          setPoliceLastUpdatedAt(Date.now());
+          policeLastFetchAtRef.current = Date.now();
+        }
+      } catch (err) {
+        if (controller.signal.aborted) return;
+        if (String(err?.message || '').includes('429')) {
+          const now = Date.now();
+          const waitSec = Math.ceil((policeBackoffUntilRef.current - now) / 1000);
+          setPoliceError(`Rate limited by Waze (429). Retrying in ~${Math.max(waitSec, 1)}s…`);
+        } else {
+          setPoliceError(err?.message || 'Failed to load police alerts');
+        }
+      } finally {
+        if (!controller.signal.aborted) setPoliceLoading(false);
+      }
+    };
+
+    timeoutId = setTimeout(run, debounceMs);
+
+    return () => {
+      controller.abort();
+      if (timeoutId) clearTimeout(timeoutId);
+    };
+  }, [mapBounds, mapZoom, wazeEnvMode]);
+
   // Default view: Europe-wide; if we have warnings, center & zoom in on the first one
   const hasWarnings = warnings.length > 0;
   const center = hasWarnings ? [warnings[0].point[0], warnings[0].point[1]] : [54.0, 15.0];
   const zoom = hasWarnings ? 8 : 4;
 
+  const policeSubtitle = useMemo(() => {
+    const ts = policeLastUpdatedAt ? new Date(policeLastUpdatedAt).toLocaleTimeString() : '';
+    if (policeLoading) return 'Loading…';
+    if (policeError) return policeError;
+    if (!policeLastUpdatedAt) return 'Waiting for map…';
+    if (policeAlerts.length === 0) return ts ? `No police in this view (updated ${ts})` : 'No police in this view';
+    return ts ? `Updated ${ts}` : 'Updated';
+  }, [policeAlerts.length, policeError, policeLastUpdatedAt, policeLoading]);
+
+  const boundsSubtitle = useMemo(() => {
+    const b = getNormalizedBoundsForDisplay(mapBounds);
+    if (!b) return '';
+    return `top ${b.north.toFixed(5)} / bottom ${b.south.toFixed(5)} / left ${b.west.toFixed(
+      5
+    )} / right ${b.east.toFixed(5)}`;
+  }, [mapBounds]);
+
+  const wazeBoxesForDebug = useMemo(() => {
+    const { debugBoxes, usedZoom } = buildWazeTileSnappedQuery(mapBounds, mapZoom);
+    return { boxes: debugBoxes, usedZoom };
+  }, [mapBounds, mapZoom]);
+
+  const effectiveEnv = useMemo(() => {
+    return wazeEnvMode === 'auto' ? inferWazeEnvFromBounds(mapBounds) : wazeEnvMode;
+  }, [mapBounds, wazeEnvMode]);
+
   return (
     <div className="App">
       <div className="Map-wrapper">
+        <div className="Map-overlay">
+          <div className="Map-overlay-title">Waze police alerts</div>
+          <div className="Map-overlay-row">
+            <span className="Map-overlay-label">Markers</span>
+            <span className="Map-overlay-value">{policeAlerts.length}</span>
+          </div>
+          <div className="Map-overlay-row">
+            <label className="Map-overlay-label" htmlFor="waze-env">
+              env
+            </label>
+            <select
+              id="waze-env"
+              value={wazeEnvMode}
+              onChange={(e) => setWazeEnvMode(e.target.value)}
+            >
+              <option value="auto">auto ({effectiveEnv})</option>
+              <option value="na">na</option>
+              <option value="row">row</option>
+            </select>
+          </div>
+          <div className="Map-overlay-row">
+            <label className="Map-overlay-label" htmlFor="toggle-boxes">
+              Show Waze boxes
+            </label>
+            <input
+              id="toggle-boxes"
+              type="checkbox"
+              checked={showWazeBoxes}
+              onChange={(e) => setShowWazeBoxes(e.target.checked)}
+            />
+          </div>
+          <div className={`Map-overlay-subtitle ${policeError ? 'is-error' : ''}`}>
+            {policeSubtitle}
+          </div>
+          {boundsSubtitle ? <div className="Map-overlay-subtitle">{boundsSubtitle}</div> : null}
+          {showWazeBoxes ? (
+            <div className="Map-overlay-subtitle">
+              boxes {wazeBoxesForDebug.boxes.length} (z {wazeBoxesForDebug.usedZoom})
+            </div>
+          ) : null}
+        </div>
+
         <MapContainer
           center={center}
           zoom={zoom}
           scrollWheelZoom={true}
           className="Leaflet-map"
+          zoomSnap={1}
+          zoomDelta={1}
         >
+          <MapBoundsWatcher
+            onViewChange={({ bounds, zoom: z }) => {
+              setMapBounds(bounds);
+              setMapZoom(z);
+            }}
+          />
           <TileLayer
             attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
             url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
           />
 
+          {showWazeBoxes
+            ? wazeBoxesForDebug.boxes.map((b) => (
+                <Rectangle
+                  // stable enough for debug; uses the box edges
+                  key={`${b.top}-${b.bottom}-${b.left}-${b.right}`}
+                  bounds={[
+                    [b.bottom, b.left],
+                    [b.top, b.right],
+                  ]}
+                  pathOptions={{ color: '#1e88e5', weight: 1, fillOpacity: 0.02 }}
+                />
+              ))
+            : null}
+
+          {policeAlerts.map((a) => (
+            <Marker key={a.id} position={[a.location.lat, a.location.lng]} icon={policeMarkerIcon}>
+              <Popup>
+                <div>
+                  <div>
+                    <strong>Type:</strong> {a.type}
+                    {a.subtype ? ` (${a.subtype})` : ''}
+                  </div>
+                  {a.city ? (
+                    <div>
+                      <strong>City:</strong> {a.city}
+                    </div>
+                  ) : null}
+                  {a.street ? (
+                    <div>
+                      <strong>Street:</strong> {a.street}
+                    </div>
+                  ) : null}
+                  {a.pubMillis ? (
+                    <div>
+                      <strong>Reported:</strong> {new Date(a.pubMillis).toLocaleString()}
+                    </div>
+                  ) : null}
+                </div>
+              </Popup>
+            </Marker>
+          ))}
+
           {warnings.map((w) => (
             <Marker
               key={w.id}
               position={[w.point[0], w.point[1]]}
-              icon={markerIcon}
+              icon={warningMarkerIcon}
             >
               <Popup>
                 <div>

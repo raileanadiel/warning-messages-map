@@ -17,17 +17,58 @@ const warningMarkerIcon = L.divIcon({
   iconAnchor: [16, 32],
 });
 
+const POLICE_BADGE_SVG = `
+  <svg
+    class="police-marker-icon__svg"
+    width="44"
+    height="44"
+    viewBox="0 0 64 64"
+    role="img"
+    aria-hidden="true"
+  >
+    <path
+      d="M32 6c8 6 16 7 22 8v18c0 15-9 23-22 28C19 55 10 47 10 32V14c6-1 14-2 22-8z"
+      fill="#1565c0"
+      stroke="#ffffff"
+      stroke-width="3"
+      stroke-linejoin="round"
+    />
+    <path
+      d="M32 13c6 4 12 5 16 6v13c0 10-6 15-16 20-10-5-16-10-16-20V19c4-1 10-2 16-6z"
+      fill="#1e88e5"
+      opacity="0.95"
+    />
+    <path
+      d="M32 22l2.9 6.3 6.8.6-5.2 4.5 1.6 6.7-6.1-3.5-6.1 3.5 1.6-6.7-5.2-4.5 6.8-.6L32 22z"
+      fill="#ffeb3b"
+      stroke="#0d47a1"
+      stroke-width="1.4"
+      stroke-linejoin="round"
+    />
+  </svg>
+`;
+
+function buildPoliceMarkerHtml(count) {
+  return `
+    <div class="police-marker-icon__wrap" aria-label="Police">
+      ${POLICE_BADGE_SVG}
+    </div>
+  `;
+}
+
 const policeMarkerIcon = L.divIcon({
   className: 'police-marker-icon',
-  html: '<div class="police-marker-icon__dot" aria-label="Police">P</div>',
-  iconSize: [28, 28],
-  iconAnchor: [14, 14],
+  // Inline SVG so it always renders (no reliance on icon-font glyph names)
+  html: buildPoliceMarkerHtml(1),
+  iconSize: [44, 44],
+  iconAnchor: [22, 44],
 });
 
 const WAZE_ALERTS_BASE_URL = '/waze/live-map/api/georss?types=alerts';
 const MAX_WAZE_TILE_BOXES_PER_REQUEST = 24;
 const MIN_WAZE_FETCH_INTERVAL_MS = 2500;
 const DEFAULT_WAZE_RETRY_AFTER_SEC = 30;
+const POLICE_CLUSTER_RADIUS_METERS = 200;
 
 function inferWazeEnvFromBounds(bounds) {
   if (!bounds) return 'na';
@@ -56,6 +97,77 @@ function normalizeLng(lng) {
 function clampLat(lat) {
   // WebMercator practical max latitude
   return Math.max(Math.min(lat, 85.05112878), -85.05112878);
+}
+
+function haversineMeters(a, b) {
+  const R = 6371000; // meters
+  const toRad = (deg) => (deg * Math.PI) / 180;
+  const dLat = toRad(b.lat - a.lat);
+  const dLng = toRad(b.lng - a.lng);
+  const lat1 = toRad(a.lat);
+  const lat2 = toRad(b.lat);
+  const sinDLat = Math.sin(dLat / 2);
+  const sinDLng = Math.sin(dLng / 2);
+  const h = sinDLat * sinDLat + Math.cos(lat1) * Math.cos(lat2) * sinDLng * sinDLng;
+  return 2 * R * Math.asin(Math.min(1, Math.sqrt(h)));
+}
+
+function clusterPoliceAlerts(alerts, radiusMeters) {
+  // Simple greedy clustering (good enough for typical alert counts).
+  // Each cluster has a representative "center" (average lat/lng) and items.
+  const remaining = alerts.slice();
+  const clusters = [];
+
+  while (remaining.length) {
+    const seed = remaining.pop();
+    const cluster = [seed];
+    let changed = true;
+
+    // Pull in points that are close to ANY point in the cluster (single-linkage).
+    while (changed) {
+      changed = false;
+      for (let i = remaining.length - 1; i >= 0; i -= 1) {
+        const candidate = remaining[i];
+        const nearAny = cluster.some(
+          (p) => haversineMeters(p.location, candidate.location) <= radiusMeters
+        );
+        if (nearAny) {
+          cluster.push(candidate);
+          remaining.splice(i, 1);
+          changed = true;
+        }
+      }
+    }
+
+    // Center as average lat/lng
+    const center = cluster.reduce(
+      (acc, p) => {
+        acc.lat += p.location.lat;
+        acc.lng += p.location.lng;
+        return acc;
+      },
+      { lat: 0, lng: 0 }
+    );
+    center.lat /= cluster.length;
+    center.lng /= cluster.length;
+
+    // Primary (for popup details): latest pubMillis
+    const primary = cluster.reduce((best, cur) => {
+      const bestTs = best?.pubMillis || 0;
+      const curTs = cur?.pubMillis || 0;
+      return curTs >= bestTs ? cur : best;
+    }, cluster[0]);
+
+    clusters.push({
+      id: primary?.id || `${center.lat}-${center.lng}-${cluster.length}`,
+      center,
+      primary,
+      count: cluster.length,
+      items: cluster,
+    });
+  }
+
+  return clusters;
 }
 
 // WebMercator tile math (slippy map)
@@ -194,6 +306,7 @@ function App() {
   const [mapZoom, setMapZoom] = useState(4);
   const [showWazeBoxes, setShowWazeBoxes] = useState(false);
   const [wazeEnvMode, setWazeEnvMode] = useState('auto'); // 'auto' | 'na' | 'row'
+  const [mapStyle, setMapStyle] = useState('cartoLight'); // 'cartoLight' | 'cartoDark' | 'cartoVoyager' | 'osm'
 
   const [policeAlerts, setPoliceAlerts] = useState([]);
   const [policeLoading, setPoliceLoading] = useState(false);
@@ -406,6 +519,10 @@ function App() {
     return ts ? `Updated ${ts}` : 'Updated';
   }, [policeAlerts.length, policeError, policeLastUpdatedAt, policeLoading]);
 
+  const policeClusters = useMemo(() => {
+    return clusterPoliceAlerts(policeAlerts, POLICE_CLUSTER_RADIUS_METERS);
+  }, [policeAlerts]);
+
   const boundsSubtitle = useMemo(() => {
     const b = getNormalizedBoundsForDisplay(mapBounds);
     if (!b) return '';
@@ -430,7 +547,7 @@ function App() {
           <div className="Map-overlay-title">Waze police alerts</div>
           <div className="Map-overlay-row">
             <span className="Map-overlay-label">Markers</span>
-            <span className="Map-overlay-value">{policeAlerts.length}</span>
+            <span className="Map-overlay-value">{policeClusters.length}</span>
           </div>
           <div className="Map-overlay-row">
             <label className="Map-overlay-label" htmlFor="waze-env">
@@ -444,6 +561,17 @@ function App() {
               <option value="auto">auto ({effectiveEnv})</option>
               <option value="na">na</option>
               <option value="row">row</option>
+            </select>
+          </div>
+          <div className="Map-overlay-row">
+            <label className="Map-overlay-label" htmlFor="map-style">
+              map
+            </label>
+            <select id="map-style" value={mapStyle} onChange={(e) => setMapStyle(e.target.value)}>
+              <option value="cartoLight">Carto Positron</option>
+              <option value="cartoVoyager">Carto Voyager (Google-like)</option>
+              <option value="cartoDark">Carto Dark Matter</option>
+              <option value="osm">OpenStreetMap</option>
             </select>
           </div>
           <div className="Map-overlay-row">
@@ -482,10 +610,27 @@ function App() {
               setMapZoom(z);
             }}
           />
-          <TileLayer
-            attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
-            url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
-          />
+          {mapStyle === 'osm' ? (
+            <TileLayer
+              attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
+              url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
+            />
+          ) : mapStyle === 'cartoVoyager' ? (
+            <TileLayer
+              attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors &copy; <a href="https://carto.com/attributions">CARTO</a>'
+              url="https://{s}.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}{r}.png"
+            />
+          ) : mapStyle === 'cartoDark' ? (
+            <TileLayer
+              attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors &copy; <a href="https://carto.com/attributions">CARTO</a>'
+              url="https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png"
+            />
+          ) : (
+            <TileLayer
+              attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors &copy; <a href="https://carto.com/attributions">CARTO</a>'
+              url="https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png"
+            />
+          )}
 
           {showWazeBoxes
             ? wazeBoxesForDebug.boxes.map((b) => (
@@ -501,27 +646,36 @@ function App() {
               ))
             : null}
 
-          {policeAlerts.map((a) => (
-            <Marker key={a.id} position={[a.location.lat, a.location.lng]} icon={policeMarkerIcon}>
+          {policeClusters.map((c) => (
+            <Marker
+              key={c.id}
+              position={[c.center.lat, c.center.lng]}
+              icon={policeMarkerIcon}
+            >
               <Popup>
                 <div>
                   <div>
-                    <strong>Type:</strong> {a.type}
-                    {a.subtype ? ` (${a.subtype})` : ''}
+                    <strong>Type:</strong> {c.primary?.type}
+                    {c.primary?.subtype ? ` (${c.primary.subtype})` : ''}
                   </div>
-                  {a.city ? (
+                  {c.count > 1 ? (
                     <div>
-                      <strong>City:</strong> {a.city}
+                      <strong>Cluster size:</strong> {c.count} alerts within ~{POLICE_CLUSTER_RADIUS_METERS}m
                     </div>
                   ) : null}
-                  {a.street ? (
+                  {c.primary?.city ? (
                     <div>
-                      <strong>Street:</strong> {a.street}
+                      <strong>City:</strong> {c.primary.city}
                     </div>
                   ) : null}
-                  {a.pubMillis ? (
+                  {c.primary?.street ? (
                     <div>
-                      <strong>Reported:</strong> {new Date(a.pubMillis).toLocaleString()}
+                      <strong>Street:</strong> {c.primary.street}
+                    </div>
+                  ) : null}
+                  {c.primary?.pubMillis ? (
+                    <div>
+                      <strong>Reported:</strong> {new Date(c.primary.pubMillis).toLocaleString()}
                     </div>
                   ) : null}
                 </div>

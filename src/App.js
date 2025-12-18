@@ -2,7 +2,7 @@ import './App.css';
 import 'leaflet/dist/leaflet.css';
 import '@mdi/font/css/materialdesignicons.min.css';
 import { useEffect, useMemo, useRef, useState } from 'react';
-import { MapContainer, TileLayer, Marker, Popup, Rectangle, useMapEvents } from 'react-leaflet';
+import { MapContainer, TileLayer, Marker, Popup, Rectangle, useMap, useMapEvents } from 'react-leaflet';
 import L from 'leaflet';
 
 // In development, CRA's proxy (defined in package.json) will forward this
@@ -299,14 +299,26 @@ function MapBoundsWatcher({ onViewChange }) {
   return null;
 }
 
+function MapInstanceBridge({ onMap }) {
+  const map = useMap();
+
+  useEffect(() => {
+    onMap(map);
+    return () => onMap(null);
+  }, [map, onMap]);
+
+  return null;
+}
+
 function App() {
   const [warnings, setWarnings] = useState([]);
   const audioRef = useRef(null);
+  const [mapInstance, setMapInstance] = useState(null);
   const [mapBounds, setMapBounds] = useState(null);
   const [mapZoom, setMapZoom] = useState(4);
   const [showWazeBoxes, setShowWazeBoxes] = useState(false);
   const [wazeEnvMode, setWazeEnvMode] = useState('auto'); // 'auto' | 'na' | 'row'
-  const [mapStyle, setMapStyle] = useState('cartoLight'); // 'cartoLight' | 'cartoDark' | 'cartoVoyager' | 'osm'
+  const [mapStyle, setMapStyle] = useState('cartoVoyager'); // 'cartoLight' | 'cartoDark' | 'cartoVoyager' | 'osm'
 
   const [policeAlerts, setPoliceAlerts] = useState([]);
   const [policeLoading, setPoliceLoading] = useState(false);
@@ -567,12 +579,36 @@ function App() {
             <label className="Map-overlay-label" htmlFor="map-style">
               map
             </label>
-            <select id="map-style" value={mapStyle} onChange={(e) => setMapStyle(e.target.value)}>
-              <option value="cartoLight">Carto Positron</option>
-              <option value="cartoVoyager">Carto Voyager (Google-like)</option>
-              <option value="cartoDark">Carto Dark Matter</option>
-              <option value="osm">OpenStreetMap</option>
-            </select>
+            <div className="Map-overlay-map-controls">
+              <select
+                id="map-style"
+                value={mapStyle}
+                onChange={(e) => setMapStyle(e.target.value)}
+              >
+                <option value="cartoVoyager">Carto Voyager (Google-like)</option>
+                <option value="cartoLight">Carto Positron</option>
+                <option value="cartoDark">Carto Dark Matter</option>
+                <option value="osm">OpenStreetMap</option>
+              </select>
+              <div className="Map-overlay-zoom-buttons">
+                <button
+                  type="button"
+                  className="Map-overlay-zoom-button"
+                  aria-label="Zoom in"
+                  onClick={() => mapInstance?.zoomIn()}
+                >
+                  +
+                </button>
+                <button
+                  type="button"
+                  className="Map-overlay-zoom-button"
+                  aria-label="Zoom out"
+                  onClick={() => mapInstance?.zoomOut()}
+                >
+                  −
+                </button>
+              </div>
+            </div>
           </div>
           <div className="Map-overlay-row">
             <label className="Map-overlay-label" htmlFor="toggle-boxes">
@@ -603,7 +639,10 @@ function App() {
           className="Leaflet-map"
           zoomSnap={1}
           zoomDelta={1}
+          zoomControl={false}
+          whenCreated={setMapInstance}
         >
+          <MapInstanceBridge onMap={setMapInstance} />
           <MapBoundsWatcher
             onViewChange={({ bounds, zoom: z }) => {
               setMapBounds(bounds);

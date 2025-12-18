@@ -95,6 +95,42 @@
   color: #fff;
 }
 
+.Map-overlay-map-controls {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 10px;
+}
+
+.Map-overlay-zoom-buttons {
+  display: inline-flex;
+  gap: 6px;
+}
+
+.Map-overlay-zoom-button {
+  width: 32px;
+  height: 28px;
+  border-radius: 8px;
+  border: 1px solid rgba(255, 255, 255, 0.18);
+  background: #0b0b0b;
+  color: #fff;
+  font-weight: 900;
+  font-size: 18px;
+  line-height: 1;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.Map-overlay-zoom-button:hover {
+  border-color: rgba(255, 255, 255, 0.35);
+}
+
+.Map-overlay-zoom-button:active {
+  transform: translateY(1px);
+}
+
 .Map-overlay-label {
   font-size: 12px;
   opacity: 0.8;

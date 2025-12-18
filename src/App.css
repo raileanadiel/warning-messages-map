@@ -152,6 +152,27 @@
   color: #ff8a80;
 }
 
+.Map-overlay-divider {
+  height: 1px;
+  background: rgba(255, 255, 255, 0.12);
+  margin: 10px 0;
+}
+
+.speedcam-marker-icon__wrap {
+  width: 34px;
+  height: 34px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.speedcam-marker-icon__svg {
+  width: 34px;
+  height: 34px;
+  display: block;
+  filter: drop-shadow(0 2px 6px rgba(0, 0, 0, 0.45));
+}
+
 .Audio-controls {
   margin-top: 8px;
 }

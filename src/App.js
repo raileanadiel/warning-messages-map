@@ -64,11 +64,52 @@ const policeMarkerIcon = L.divIcon({
   iconAnchor: [22, 44],
 });
 
+const SPEED_CAMERA_SVG = `
+  <svg
+    class="speedcam-marker-icon__svg"
+    width="34"
+    height="34"
+    viewBox="0 0 64 64"
+    role="img"
+    aria-hidden="true"
+  >
+    <path
+      d="M10 22c0-4 3-7 7-7h30c4 0 7 3 7 7v20c0 4-3 7-7 7H17c-4 0-7-3-7-7V22z"
+      fill="#0b0b0b"
+      stroke="#ffffff"
+      stroke-width="3"
+      stroke-linejoin="round"
+    />
+    <circle cx="32" cy="32" r="10" fill="#1e88e5" stroke="#ffffff" stroke-width="3" />
+    <circle cx="32" cy="32" r="4" fill="#0b0b0b" />
+    <path
+      d="M20 15l6-7h12l6 7"
+      fill="#ffeb3b"
+      stroke="#0b0b0b"
+      stroke-width="3"
+      stroke-linejoin="round"
+    />
+  </svg>
+`;
+
+const speedCamMarkerIcon = L.divIcon({
+  className: 'speedcam-marker-icon',
+  html: `
+    <div class="speedcam-marker-icon__wrap" aria-label="Speed camera">
+      ${SPEED_CAMERA_SVG}
+    </div>
+  `,
+  iconSize: [34, 34],
+  iconAnchor: [17, 34],
+});
+
 const WAZE_ALERTS_BASE_URL = '/waze/live-map/api/georss?types=alerts';
 const MAX_WAZE_TILE_BOXES_PER_REQUEST = 24;
 const MIN_WAZE_FETCH_INTERVAL_MS = 2500;
 const DEFAULT_WAZE_RETRY_AFTER_SEC = 30;
 const POLICE_CLUSTER_RADIUS_METERS = 200;
+const SPEED_RADAR_CLUSTER_RADIUS_METERS = 200;
+const SPEED_RADARS_CSV_URL = `${process.env.PUBLIC_URL || ''}/SCDB_Speed_Romania.csv`;
 
 function inferWazeEnvFromBounds(bounds) {
   if (!bounds) return 'na';
@@ -168,6 +209,93 @@ function clusterPoliceAlerts(alerts, radiusMeters) {
   }
 
   return clusters;
+}
+
+function clusterPoints(points, radiusMeters) {
+  // Generic clustering for points shaped like { lat, lng, ... }.
+  const remaining = points.slice();
+  const clusters = [];
+
+  while (remaining.length) {
+    const seed = remaining.pop();
+    const cluster = [seed];
+    let changed = true;
+
+    while (changed) {
+      changed = false;
+      for (let i = remaining.length - 1; i >= 0; i -= 1) {
+        const candidate = remaining[i];
+        const nearAny = cluster.some(
+          (p) => haversineMeters({ lat: p.lat, lng: p.lng }, { lat: candidate.lat, lng: candidate.lng }) <= radiusMeters
+        );
+        if (nearAny) {
+          cluster.push(candidate);
+          remaining.splice(i, 1);
+          changed = true;
+        }
+      }
+    }
+
+    const center = cluster.reduce(
+      (acc, p) => {
+        acc.lat += p.lat;
+        acc.lng += p.lng;
+        return acc;
+      },
+      { lat: 0, lng: 0 }
+    );
+    center.lat /= cluster.length;
+    center.lng /= cluster.length;
+
+    const primary = cluster[0];
+
+    clusters.push({
+      id: primary?.id || `${center.lat}-${center.lng}-${cluster.length}`,
+      center,
+      count: cluster.length,
+      items: cluster,
+      primary,
+    });
+  }
+
+  return clusters;
+}
+
+function parseSpeedRadarCsv(text) {
+  const lines = String(text || '')
+    .split(/\r?\n/)
+    .map((l) => l.trim())
+    .filter(Boolean);
+
+  const points = [];
+
+  for (const line of lines) {
+    const firstComma = line.indexOf(',');
+    const secondComma = firstComma >= 0 ? line.indexOf(',', firstComma + 1) : -1;
+    if (firstComma < 0 || secondComma < 0) continue;
+
+    // Format seems to be: lng,lat,<desc...>[,]<[id]>...
+    const lngStr = line.slice(0, firstComma).trim();
+    const latStr = line.slice(firstComma + 1, secondComma).trim();
+    const rest = line.slice(secondComma + 1);
+
+    const lng = Number(lngStr);
+    const lat = Number(latStr);
+    if (!Number.isFinite(lat) || !Number.isFinite(lng)) continue;
+
+    const idMatch = rest.match(/\[([^\]]+)\]/);
+    if (!idMatch) continue;
+    const id = String(idMatch[1]).trim();
+
+    const bracketIdx = rest.indexOf('[');
+    let desc = bracketIdx >= 0 ? rest.slice(0, bracketIdx).trim() : '';
+    if (desc.startsWith('"') && desc.endsWith('"')) desc = desc.slice(1, -1);
+
+    points.push({ id, lat, lng, desc });
+  }
+
+  const byId = new Map(points.map((p) => [p.id, p]));
+  return Array.from(byId.values());
 }
 
 // WebMercator tile math (slippy map)
@@ -328,6 +456,10 @@ function App() {
   const policeLastFetchAtRef = useRef(0);
   const policeLastQueryKeyRef = useRef('');
 
+  const [speedRadars, setSpeedRadars] = useState([]);
+  const [speedRadarsError, setSpeedRadarsError] = useState('');
+  const [showSpeedRadars, setShowSpeedRadars] = useState(true);
+
   useEffect(() => {
     let isMounted = true;
 
@@ -392,6 +524,33 @@ function App() {
     return () => {
       isMounted = false;
       clearInterval(intervalId);
+    };
+  }, []);
+
+  useEffect(() => {
+    let isMounted = true;
+    const controller = new AbortController();
+
+    const run = async () => {
+      try {
+        setSpeedRadarsError('');
+        const res = await fetch(SPEED_RADARS_CSV_URL, { signal: controller.signal });
+        if (!res.ok) throw new Error(`Failed to load speed radars CSV (${res.status})`);
+        const text = await res.text();
+        const parsed = parseSpeedRadarCsv(text);
+        if (isMounted) setSpeedRadars(parsed);
+      } catch (err) {
+        if (!controller.signal.aborted) {
+          setSpeedRadarsError(err?.message || 'Failed to load speed radars');
+        }
+      }
+    };
+
+    run();
+
+    return () => {
+      isMounted = false;
+      controller.abort();
     };
   }, []);
 
@@ -535,6 +694,10 @@ function App() {
     return clusterPoliceAlerts(policeAlerts, POLICE_CLUSTER_RADIUS_METERS);
   }, [policeAlerts]);
 
+  const speedRadarClusters = useMemo(() => {
+    return clusterPoints(speedRadars, SPEED_RADAR_CLUSTER_RADIUS_METERS);
+  }, [speedRadars]);
+
   const boundsSubtitle = useMemo(() => {
     const b = getNormalizedBoundsForDisplay(mapBounds);
     if (!b) return '';
@@ -624,6 +787,30 @@ function App() {
           <div className={`Map-overlay-subtitle ${policeError ? 'is-error' : ''}`}>
             {policeSubtitle}
           </div>
+          <div className="Map-overlay-divider" />
+          <div className="Map-overlay-title">Speed radars (Romania)</div>
+          <div className="Map-overlay-row">
+            <label className="Map-overlay-label" htmlFor="toggle-speed-radars">
+              Show
+            </label>
+            <input
+              id="toggle-speed-radars"
+              type="checkbox"
+              checked={showSpeedRadars}
+              onChange={(e) => setShowSpeedRadars(e.target.checked)}
+            />
+          </div>
+          <div className="Map-overlay-row">
+            <span className="Map-overlay-label">Markers</span>
+            <span className="Map-overlay-value">{showSpeedRadars ? speedRadarClusters.length : 0}</span>
+          </div>
+          {speedRadarsError ? (
+            <div className="Map-overlay-subtitle is-error">{speedRadarsError}</div>
+          ) : speedRadars.length > 0 && showSpeedRadars ? (
+            <div className="Map-overlay-subtitle">
+              loaded {speedRadars.length} radars • grouped into {speedRadarClusters.length} markers (≤{SPEED_RADAR_CLUSTER_RADIUS_METERS}m)
+            </div>
+          ) : null}
           {boundsSubtitle ? <div className="Map-overlay-subtitle">{boundsSubtitle}</div> : null}
           {showWazeBoxes ? (
             <div className="Map-overlay-subtitle">
@@ -682,6 +869,30 @@ function App() {
                   ]}
                   pathOptions={{ color: '#1e88e5', weight: 1, fillOpacity: 0.02 }}
                 />
+              ))
+            : null}
+
+          {showSpeedRadars
+            ? speedRadarClusters.map((c) => (
+                <Marker
+                  key={`speed-${c.id}`}
+                  position={[c.center.lat, c.center.lng]}
+                  icon={speedCamMarkerIcon}
+                >
+                  <Popup>
+                    <div>
+                      <div>
+                        <strong>Speed radars:</strong> {c.count} within ~{SPEED_RADAR_CLUSTER_RADIUS_METERS}m
+                      </div>
+                      {c.items.slice(0, 8).map((p) => (
+                        <div key={p.id}>
+                          <strong>{p.id}</strong> {p.desc ? `— ${p.desc}` : ''}
+                        </div>
+                      ))}
+                      {c.items.length > 8 ? <div>…and {c.items.length - 8} more</div> : null}
+                    </div>
+                  </Popup>
+                </Marker>
               ))
             : null}
 

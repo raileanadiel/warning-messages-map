@@ -109,7 +109,10 @@ const MIN_WAZE_FETCH_INTERVAL_MS = 2500;
 const DEFAULT_WAZE_RETRY_AFTER_SEC = 30;
 const POLICE_CLUSTER_RADIUS_METERS = 200;
 const SPEED_RADAR_CLUSTER_RADIUS_METERS = 200;
-const SPEED_RADARS_CSV_URL = `${process.env.PUBLIC_URL || ''}/SCDB_Speed_Romania.csv`;
+const SPEED_RADARS_WORLD_CSV_URL = `${process.env.PUBLIC_URL || ''}/SCDB_Speed.csv`;
+const MIN_SPEED_RADAR_RENDER_ZOOM = 6;
+const MAX_VISIBLE_SPEED_RADARS = 8000;
+const SPEED_RADAR_VIEW_PADDING_METERS = 50_000;
 
 function inferWazeEnvFromBounds(bounds) {
   if (!bounds) return 'na';
@@ -298,6 +301,37 @@ function parseSpeedRadarCsv(text) {
   return Array.from(byId.values());
 }
 
+function isPointInBounds(point, bounds) {
+  if (!bounds) return false;
+  const north = bounds.getNorth();
+  const south = bounds.getSouth();
+  const west = normalizeLng(bounds.getWest());
+  const east = normalizeLng(bounds.getEast());
+
+  if (point.lat > north || point.lat < south) return false;
+
+  const lng = normalizeLng(point.lng);
+  // Handle dateline crossing
+  if (west > east) {
+    return lng >= west || lng <= east;
+  }
+  return lng >= west && lng <= east;
+}
+
+function isPointInBoundsPadded(point, bounds, padMeters) {
+  if (!bounds) return false;
+  const c = bounds.getCenter();
+  const latPad = padMeters / 111320; // ~ meters per degree latitude
+  const lngPad =
+    padMeters / (111320 * Math.max(0.15, Math.cos((c.lat * Math.PI) / 180))); // avoid blowups near poles
+
+  const padded = L.latLngBounds(
+    [bounds.getSouth() - latPad, bounds.getWest() - lngPad],
+    [bounds.getNorth() + latPad, bounds.getEast() + lngPad]
+  );
+  return isPointInBounds(point, padded);
+}
+
 // WebMercator tile math (slippy map)
 function lng2tileX(lng, z) {
   const n = 2 ** z;
@@ -446,7 +480,7 @@ function App() {
   const [mapZoom, setMapZoom] = useState(4);
   const [showWazeBoxes, setShowWazeBoxes] = useState(false);
   const [wazeEnvMode, setWazeEnvMode] = useState('auto'); // 'auto' | 'na' | 'row'
-  const [mapStyle, setMapStyle] = useState('cartoVoyager'); // 'cartoLight' | 'cartoDark' | 'cartoVoyager' | 'osm'
+  const [mapStyle, setMapStyle] = useState('osm'); // 'cartoLight' | 'cartoDark' | 'cartoVoyager' | 'osm'
 
   const [policeAlerts, setPoliceAlerts] = useState([]);
   const [policeLoading, setPoliceLoading] = useState(false);
@@ -456,9 +490,11 @@ function App() {
   const policeLastFetchAtRef = useRef(0);
   const policeLastQueryKeyRef = useRef('');
 
-  const [speedRadars, setSpeedRadars] = useState([]);
-  const [speedRadarsError, setSpeedRadarsError] = useState('');
   const [showSpeedRadars, setShowSpeedRadars] = useState(true);
+  const [speedRadarsWorld, setSpeedRadarsWorld] = useState([]);
+  const [speedRadarsWorldError, setSpeedRadarsWorldError] = useState('');
+  const [speedRadarsWorldName, setSpeedRadarsWorldName] = useState('');
+  const [speedRadarsWorldLoading, setSpeedRadarsWorldLoading] = useState(false);
 
   useEffect(() => {
     let isMounted = true;
@@ -528,21 +564,28 @@ function App() {
   }, []);
 
   useEffect(() => {
+    // Load worldwide radars by default from public/SCDB_Speed.csv
     let isMounted = true;
     const controller = new AbortController();
 
     const run = async () => {
+      setSpeedRadarsWorldError('');
+      setSpeedRadarsWorldLoading(true);
       try {
-        setSpeedRadarsError('');
-        const res = await fetch(SPEED_RADARS_CSV_URL, { signal: controller.signal });
-        if (!res.ok) throw new Error(`Failed to load speed radars CSV (${res.status})`);
+        const res = await fetch(SPEED_RADARS_WORLD_CSV_URL, { signal: controller.signal });
+        if (!res.ok) throw new Error(`Failed to load speed radars CSV (world) (${res.status})`);
         const text = await res.text();
         const parsed = parseSpeedRadarCsv(text);
-        if (isMounted) setSpeedRadars(parsed);
-      } catch (err) {
-        if (!controller.signal.aborted) {
-          setSpeedRadarsError(err?.message || 'Failed to load speed radars');
+        if (isMounted) {
+          setSpeedRadarsWorld(parsed);
+          setSpeedRadarsWorldName('SCDB_Speed.csv');
         }
+      } catch (err) {
+        if (!controller.signal.aborted && isMounted) {
+          setSpeedRadarsWorldError(err?.message || 'Failed to load speed radars (world)');
+        }
+      } finally {
+        if (!controller.signal.aborted && isMounted) setSpeedRadarsWorldLoading(false);
       }
     };
 
@@ -694,9 +737,32 @@ function App() {
     return clusterPoliceAlerts(policeAlerts, POLICE_CLUSTER_RADIUS_METERS);
   }, [policeAlerts]);
 
-  const speedRadarClusters = useMemo(() => {
-    return clusterPoints(speedRadars, SPEED_RADAR_CLUSTER_RADIUS_METERS);
-  }, [speedRadars]);
+  const speedRadarsInView = useMemo(() => {
+    const active = speedRadarsWorld;
+    if (!showSpeedRadars) return { clusters: [], inViewCount: 0, tooMany: false };
+    if (!mapBounds) return { clusters: [], inViewCount: 0, tooMany: false };
+    if (mapZoom < MIN_SPEED_RADAR_RENDER_ZOOM) return { clusters: [], inViewCount: 0, tooMany: false };
+    if (speedRadarsWorldLoading) return { clusters: [], inViewCount: 0, tooMany: false };
+
+    // Only render points in current viewport (performance for worldwide CSV)
+    const visible = [];
+    let inViewCount = 0;
+    for (const p of active) {
+      if (isPointInBoundsPadded(p, mapBounds, SPEED_RADAR_VIEW_PADDING_METERS)) {
+        inViewCount += 1;
+        if (visible.length <= MAX_VISIBLE_SPEED_RADARS) visible.push(p);
+        if (inViewCount > MAX_VISIBLE_SPEED_RADARS) {
+          // Don't render partial results; force the user to zoom in for a smaller viewport.
+          return { clusters: [], inViewCount, tooMany: true };
+        }
+      }
+    }
+    return {
+      clusters: clusterPoints(visible, SPEED_RADAR_CLUSTER_RADIUS_METERS),
+      inViewCount,
+      tooMany: false,
+    };
+  }, [mapBounds, mapZoom, showSpeedRadars, speedRadarsWorld, speedRadarsWorldLoading]);
 
   const boundsSubtitle = useMemo(() => {
     const b = getNormalizedBoundsForDisplay(mapBounds);
@@ -718,6 +784,16 @@ function App() {
   return (
     <div className="App">
       <div className="Map-wrapper">
+        {speedRadarsWorldLoading ? (
+          <div className="Map-preload">
+            <div className="Map-preload-card">
+              <div className="Map-preload-title">Loading speed radars…</div>
+              <div className="Map-preload-subtitle">
+                Parsing worldwide CSV ({speedRadarsWorldName || 'SCDB_Speed.csv'}). This can take a few seconds.
+              </div>
+            </div>
+          </div>
+        ) : null}
         <div className="Map-overlay">
           <div className="Map-overlay-title">Waze police alerts</div>
           <div className="Map-overlay-row">
@@ -748,10 +824,10 @@ function App() {
                 value={mapStyle}
                 onChange={(e) => setMapStyle(e.target.value)}
               >
+                <option value="osm">OpenStreetMap (default)</option>
                 <option value="cartoVoyager">Carto Voyager (Google-like)</option>
                 <option value="cartoLight">Carto Positron</option>
                 <option value="cartoDark">Carto Dark Matter</option>
-                <option value="osm">OpenStreetMap</option>
               </select>
               <div className="Map-overlay-zoom-buttons">
                 <button
@@ -788,7 +864,7 @@ function App() {
             {policeSubtitle}
           </div>
           <div className="Map-overlay-divider" />
-          <div className="Map-overlay-title">Speed radars (Romania)</div>
+          <div className="Map-overlay-title">Speed radars (world)</div>
           <div className="Map-overlay-row">
             <label className="Map-overlay-label" htmlFor="toggle-speed-radars">
               Show
@@ -798,18 +874,38 @@ function App() {
               type="checkbox"
               checked={showSpeedRadars}
               onChange={(e) => setShowSpeedRadars(e.target.checked)}
+              disabled={speedRadarsWorldLoading}
             />
           </div>
           <div className="Map-overlay-row">
             <span className="Map-overlay-label">Markers</span>
-            <span className="Map-overlay-value">{showSpeedRadars ? speedRadarClusters.length : 0}</span>
+            <span className="Map-overlay-value">
+              {showSpeedRadars ? speedRadarsInView.clusters.length : 0}
+            </span>
           </div>
-          {speedRadarsError ? (
-            <div className="Map-overlay-subtitle is-error">{speedRadarsError}</div>
-          ) : speedRadars.length > 0 && showSpeedRadars ? (
-            <div className="Map-overlay-subtitle">
-              loaded {speedRadars.length} radars • grouped into {speedRadarClusters.length} markers (≤{SPEED_RADAR_CLUSTER_RADIUS_METERS}m)
-            </div>
+          {speedRadarsWorldError ? (
+            <div className="Map-overlay-subtitle is-error">{speedRadarsWorldError}</div>
+          ) : speedRadarsWorldLoading ? (
+            <div className="Map-overlay-subtitle">Loading speed radars…</div>
+          ) : speedRadarsWorld.length > 0 && showSpeedRadars ? (
+            mapZoom < MIN_SPEED_RADAR_RENDER_ZOOM ? (
+              <div className="Map-overlay-subtitle">
+                loaded {speedRadarsWorld.length} radars ({speedRadarsWorldName || 'SCDB_Speed.csv'}) • zoom in to ≥{MIN_SPEED_RADAR_RENDER_ZOOM} to render
+              </div>
+            ) : speedRadarsInView.tooMany ? (
+              <div className="Map-overlay-subtitle is-error">
+                too many radars in view ({speedRadarsInView.inViewCount}). Zoom in or reduce the area.
+              </div>
+            ) : speedRadarsInView.inViewCount === 0 ? (
+              <div className="Map-overlay-subtitle">
+                no radars found in/near this area (padding {Math.round(SPEED_RADAR_VIEW_PADDING_METERS / 1000)}km)
+              </div>
+            ) : (
+              <div className="Map-overlay-subtitle">
+                loaded {speedRadarsWorld.length} radars ({speedRadarsWorldName || 'SCDB_Speed.csv'}) • showing
+                {speedRadarsInView.clusters.length} markers (≤{SPEED_RADAR_CLUSTER_RADIUS_METERS}m)
+              </div>
+            )
           ) : null}
           {boundsSubtitle ? <div className="Map-overlay-subtitle">{boundsSubtitle}</div> : null}
           {showWazeBoxes ? (
@@ -873,7 +969,7 @@ function App() {
             : null}
 
           {showSpeedRadars
-            ? speedRadarClusters.map((c) => (
+            ? speedRadarsInView.clusters.map((c) => (
                 <Marker
                   key={`speed-${c.id}`}
                   position={[c.center.lat, c.center.lng]}
